@@ -6,24 +6,13 @@ import fs from 'fs';
 import path from 'path';
 import * as parser from '@babel/parser';
 import * as types from '@babel/types';
-import generate from '@babel/generator';
+import glob from 'glob';
+import {DevTool, WebpackVersion, getModuleEntries} from './ast';
 
 enum ErrorMsg {
     NO_BUNDLE_FILE = 'No bundle file found.',
     ONLY_ONE_BUNDLE_FILE = 'Only one bundle file is allowed.',
     NOT_EXPECT_BUNDLE_FILE = 'Not the expected bundle.',
-}
-
-enum DevTool {
-    NONE = 'none',
-    EVAL = 'eval',
-    SOURCE_MAP = 'source-map',
-}
-
-enum WebpackVersion {
-    V4 = '4',
-    V5 = '5',
-    NEXT = 'next',
 }
 
 interface Params {
@@ -33,71 +22,92 @@ interface Params {
     webpackVersion?: WebpackVersion;
 }
 
-
 class Debundle {
     input: string;
     output: string;
-    content: string;
-    modules?: any[][] = [[]]
+    content?: string | Array<Record<string, Promise<string>>>;
+    modules: Array<[string, string]> | Promise<Array<[string, string]>[]> = []
+    devTool?: DevTool;
+    webpackVersion?: WebpackVersion;
 
     constructor(params: Params) {
         this.input = path.resolve(params.input);
         this.output = path.resolve(params.output || './output');
+        this.devTool = params.devTool;
+        this.webpackVersion = params.webpackVersion;
 
         if (!fse.existsSync(this.input)) {
             throw Error(ErrorMsg.NO_BUNDLE_FILE);
         }
-        this.content = fs.readFileSync(this.input, 'utf-8');
+        const stats = fs.statSync(this.input);
+        if (stats.isFile()) {
+            this.content = fs.readFileSync(this.input, 'utf-8');
+        } else if (stats.isDirectory()) {
+            this.content = this.traverse(`${this.input}/**/*.js`).map(file => ({
+                [file]: new Promise((resolve, reject) => fs.readFile(file, (err, data) => {
+                    if (err) {
+                        reject(err);
+                    }
+                    resolve(data.toString());
+                }))
+            }));
+        }
+    }
+
+    traverse(path: string) {
+        return glob.sync(path, {
+            ignore: ['.DS_Store'],
+        });
     }
 
     analysis() {
-        const ast = parser.parse(this.content, {
-            sourceType: 'module'
-        });
-        this.modules = this.identify(ast);
-
+        if (typeof this.content === 'string') {
+            const ast = parser.parse(this.content, {
+                sourceType: 'module'
+            });
+            this.modules = this.identify(ast);
+        } else if (this.content && this.content.length) {
+            this.modules = Promise.all(this.content.map(async (file: Record<string, Promise<string>>) => {
+                const [_, content] = Object.entries(file)[0];
+                const ast = parser.parse(await content, {
+                    sourceType: 'module'
+                });
+                return this.identify(ast);
+            }));
+        }
         return this;
     }
 
-    identify(ast: parser.ParseResult<types.File>, devTool?: DevTool, webpackVersion?: WebpackVersion) {
+    identify(ast: parser.ParseResult<types.File>) {
         const body = ast.program.body;
         if (body.length !== 1) {
             throw Error(ErrorMsg.ONLY_ONE_BUNDLE_FILE);
         }
         try {
-            const expressionStatement = body[0];
-            if (
-                expressionStatement.type === 'ExpressionStatement'
-                && expressionStatement.expression.type === 'CallExpression'
-                && expressionStatement.expression.callee.type === 'ArrowFunctionExpression'
-                && expressionStatement.expression.callee.body.type === 'BlockStatement'
-                && expressionStatement.expression.callee.body.body[0].type === 'VariableDeclaration'
-                && expressionStatement.expression.callee.body.body[0].declarations[0].id.type === 'Identifier'
-                && expressionStatement.expression.callee.body.body[0].declarations[0].id.name === '__webpack_modules__'
-                && expressionStatement.expression.callee.body.body[0].declarations[0].init?.type === 'ObjectExpression'
-            ) {
-                const properties = expressionStatement.expression.callee.body.body[0].declarations[0].init.properties;
-                const moduleEntries = properties.map(property => {
-                    if (property.type === 'ObjectProperty' && property.key.type === 'StringLiteral') {
-                        const path = property.key.value;
-                        const rawContent = generate(property.value).code;
-                        return [path, rawContent]
-                    }
-                    return [];
-                })
-                return moduleEntries;
-            }
+            return getModuleEntries(ast, this.devTool, this.webpackVersion);
         } catch (e) {
             throw Error(ErrorMsg.NOT_EXPECT_BUNDLE_FILE);
         }
     }
 
     outputFiles() {
-        this.modules?.forEach(module => {
-            const [p, content] = module;
-            const filepath = path.resolve(this.output, p);
-            fse.outputFileSync(filepath, content);
-        })
+        if (this.modules instanceof Promise) {
+            const packages = this.modules;
+            packages.then(packageModule => packageModule.forEach(async (modules, index) => {
+                modules.forEach(module => {
+                    const [file, content] = module;
+                    const filePath = path.resolve(this.output, file);
+                    fse.ensureFileSync(filePath);
+                    fse.writeFileSync(filePath, content);
+                });
+            }));
+        } else {
+            this.modules?.forEach(module => {
+                const [file, content] = module;
+                const filepath = path.resolve(this.output, file);
+                fse.outputFileSync(filepath, content);
+            })
+        }
     }
 }
 
